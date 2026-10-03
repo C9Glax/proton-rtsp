@@ -4,6 +4,25 @@ Diagnostics for the case where a game's frame rate drops to the video's frame
 rate (or a multiple of it) while a video or stream is playing, e.g. VRChat with
 Unity VideoPlayer / AVPro Video.
 
+## Building with the diagnostics
+
+The profiling code is not part of the normal build. It lives in
+`patches/diagnostics/mf-diagnostics.patch` and is applied to the Wine source
+only when you ask for it, either at configure time:
+
+```
+./configure.sh --container-engine=podman --enable-mf-diagnostics
+make redist
+```
+
+or per invocation, `make redist MF_DIAGNOSTICS=1`. Without the flag (the default)
+`WINE_MFME_PROFILE` and `WINE_MFRW_PROFILE` do nothing because the code does not
+exist. Switching the flag restores the unpatched source and rebuilds the affected
+DLLs (`mfmediaengine`, `mfreadwrite`).
+
+The keyed mutex fix in DXVK (below) is part of every build; it is not a
+diagnostic.
+
 ## Usage
 
 Set `WINE_MFME_PROFILE=1` in the game's launch options, start playback, and

@@ -188,6 +188,9 @@ function configure() {
     if [[ -n "$arg_enable_ccache" ]]; then
       echo "ENABLE_CCACHE := 1"
     fi
+    if [[ -n "$arg_enable_mf_diagnostics" ]]; then
+      echo "MF_DIAGNOSTICS := 1"
+    fi
 
     # Include base
     echo ""
@@ -209,6 +212,7 @@ arg_container_engine=""
 arg_docker_opts=""
 arg_relabel_volumes=""
 arg_enable_ccache=""
+arg_enable_mf_diagnostics=""
 arg_help=""
 invalid_args=""
 function parse_args() {
@@ -258,6 +262,8 @@ function parse_args() {
       arg_relabel_volumes="1"
     elif [[ $arg = --enable-ccache ]]; then
       arg_enable_ccache="1"
+    elif [[ $arg = --enable-mf-diagnostics ]]; then
+      arg_enable_mf_diagnostics="1"
     elif [[ $arg = --proton-sdk-image ]]; then
       val_used=1
       arg_protonsdk_image="$val"
@@ -314,6 +320,8 @@ usage() {
   "$1" "    --relabel-volumes Bind-mounted volumes will be relabeled. Use with caution."
   "$1" ""
   "$1" "    --enable-ccache Mount \$CCACHE_DIR or \$HOME/.ccache inside of the container and use ccache for the build."
+  "$1" ""
+  "$1" "    --enable-mf-diagnostics Apply patches/diagnostics/mf-diagnostics.patch to Wine (WINE_MFME_PROFILE / WINE_MFRW_PROFILE)."
   "$1" ""
   "$1" "  Steam Runtime"
   "$1" "    Proton builds that are to be installed & run under the steam client must be built with"
