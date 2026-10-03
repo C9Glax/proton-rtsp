@@ -25,11 +25,14 @@ for mode in fixed blocking; do
   rm -f "$here/kmtest-$mode.log"
   mkdir -p "$here/logs"
   rc=0
-  PROTON_LOG=1 PROTON_LOG_DIR="$here/logs" "$proton/proton" run "$here/kmtest.exe" "${2:-300}" "${3:-20}" "${4:-1920}" >/dev/null 2>&1 || rc=$?
+  rm -f "$here"/logs/*.log; PROTON_LOG=1 PROTON_LOG_DIR="$here/logs" DXVK_LOG_PATH="$here/logs" DXVK_LOG_LEVEL=info "$proton/proton" run "$here/kmtest.exe" "${2:-300}" "${3:-20}" "${4:-1920}" >/dev/null 2>&1 || rc=$?
   if [ -s "$here/kmtest-$mode.log" ]; then
     cat "$here/kmtest-$mode.log"
   else
     echo "No output was written (exit code $rc): kmtest.exe did not start or crashed."
     echo "Check $here/logs/steam-*.log (search for 'err:' and 'kmtest')."
   fi
+  echo "--- DXVK warnings/errors ($mode) ---"
+  grep -hiE 'warn|err|keyed|shared' "$here"/logs/*d3d11.log "$here"/logs/*dxgi.log 2>/dev/null | head -n 20 || true
+  cp -f "$here"/logs/*d3d11.log "$here/logs/last-$mode-d3d11.txt" 2>/dev/null || true
 done

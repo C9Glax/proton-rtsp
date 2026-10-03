@@ -30,6 +30,17 @@ static double now_ms() {
   return 1000.0 * double(t.QuadPart) / double(f.QuadPart);
 }
 
+static void wait_gpu(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+  D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+  ID3D11Query* q = nullptr;
+  if (FAILED(dev->CreateQuery(&qd, &q))) return;
+  ctx->End(q);
+  ctx->Flush();
+  BOOL done = FALSE;
+  while (ctx->GetData(q, &done, sizeof(done), 0) != S_OK || !done) Sleep(0);
+  q->Release();
+}
+
 struct Stat {
   std::vector<double> v;
   void add(double x) { v.push_back(x); }
@@ -109,6 +120,37 @@ int main(int argc, char** argv) {
   CHECK(devA->CreateTexture2D(&ld, nullptr, &l0));
   CHECK(devA->CreateTexture2D(&ld, nullptr, &l1));
 
+  // Sanity phase, no reliance on GPU synchronisation: write a value, wait for the GPU
+  // to finish with an event query, hand over with the keyed mutex, read it back. If this
+  // already fails, sharing itself does not work here and the results below mean nothing.
+  int sanityGot = -1;
+  {
+    CHECK(kmA->AcquireSync(0, 5000));
+    float c[4] = { 77.f / 255.f, 0.f, 0.f, 1.f };
+    ctxA->ClearRenderTargetView(rtv, c);
+    wait_gpu(devA, ctxA);
+    CHECK(kmA->ReleaseSync(1));
+    CHECK(kmB->AcquireSync(1, 5000));
+    ctxB->CopyResource(staging, sharedB);
+    D3D11_MAPPED_SUBRESOURCE m;
+    CHECK(ctxB->Map(staging, 0, D3D11_MAP_READ, 0, &m));
+    sanityGot = ((const unsigned char*)m.pData)[(h / 2) * m.RowPitch + (w / 2) * 4 + 2];
+    ctxB->Unmap(staging, 0);
+    CHECK(kmB->ReleaseSync(0));
+    printf("sanity check (value 77 written, waited for GPU, read back): got %d -> %s\n",
+      sanityGot, sanityGot == 77 ? "ok" : "SHARING DOES NOT WORK");
+  }
+
+  // How long does the producer's load take on the GPU?
+  {
+    wait_gpu(devA, ctxA);
+    double t = now_ms();
+    for (int k = 0; k < load; k++) ctxA->CopyResource((k & 1) ? l1 : l0, (k & 1) ? l0 : l1);
+    wait_gpu(devA, ctxA);
+    printf("GPU time of one frame's load: %.2f ms (should be several ms for the test to mean anything;\n"
+           "  raise the 'load' argument if it is not)\n", now_ms() - t);
+  }
+
   Stat prodAcquire, prodRelease, consAcquire, consTotal, producerFrame;
   int stale = 0, bad = 0;
 
@@ -156,6 +198,11 @@ int main(int argc, char** argv) {
   consAcquire.print("consumer AcquireSync");
   producerFrame.print("producer frame time");
   printf("\n  stale frames seen by consumer: %d\n  wrong pixel values:            %d\n", stale, bad);
+  if (sanityGot != 77) {
+    printf("\nINCONCLUSIVE: the shared texture did not carry data to the second device even with explicit\n"
+           "GPU waits, so sharing itself is not working in this setup (check the DXVK log).\n");
+    return 4;
+  }
   printf("\n%s\n", (stale || bad) ? "FAIL: consumer saw data from before the producer's GPU work finished"
                                    : "PASS: consumer always saw the current frame");
   return (stale || bad) ? 2 : 0;
