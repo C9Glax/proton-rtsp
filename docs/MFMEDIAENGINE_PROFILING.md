@@ -74,6 +74,38 @@ size of the texture the app gave us (`dst`). Unusual flags such as a shared or
 dynamic texture, many mip levels, or a very large size can make a texture more
 expensive to draw with later.
 
+## Keyed mutex synchronization in DXVK (`DXVK_KEYED_MUTEX_BLOCKING`)
+
+The `dst` line printed by `WINE_MFME_PROFILE=1` shows that AVPro Video creates the
+texture it receives frames in with `MiscFlags=0x900`, which is
+`D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`: it is
+shared with another D3D11 device (Unity's) and guarded by a keyed mutex.
+
+In DXVK (as of `2cae043`), `IDXGIKeyedMutex::ReleaseSync` blocked the calling thread
+until the GPU had finished all work using the texture, and `AcquireSync` waited on the
+CPU for the previous owner's fence value. A tiny copy on the second device is executed
+behind everything the game has queued, so with a busy GPU each call stalled the calling
+thread, and with it the render thread, for about a frame, once per video frame. The CPU
+and the GPU could then no longer overlap, which makes a scene that was just fast enough for
+37.5fps at 75Hz fall to 25fps. It also explains why the stall only shows while the screen
+is in view or the GPU is busy, why the Wine media engine itself looks cheap, and why a
+Unity player (no keyed mutex) is unaffected.
+
+The `dxvk` submodule now points to `C9Glax/dxvk` (branch `keyed-mutex-gpu-sync`), where
+acquire and release synchronize with fences on the GPU like native Windows does: the
+release queues a signal of the shared fence after the work submitted so far, and the
+acquire only takes the mutex and queues a GPU wait for the fence value.
+
+| Variable | Effect |
+| --- | --- |
+| `DXVK_KEYED_MUTEX_BLOCKING=1` | Use the old behaviour (wait for the GPU on the CPU), to compare with the same build |
+
+To compare, play the same stream in the same world and note your frame rate with
+the default, and with `DXVK_KEYED_MUTEX_BLOCKING=1`.
+
+After pulling, run `git submodule sync dxvk && git submodule update --init dxvk`
+since the submodule URL changed.
+
 ## Source Reader players (`WINE_MFRW_PROFILE`)
 
 Players that decode through `IMFSourceReader` (for example Unity's built-in
