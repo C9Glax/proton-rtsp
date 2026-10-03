@@ -54,6 +54,26 @@ mfme-prof 0x... : window 1000123us | tick: n=75 with_frame=30 gap_max=14000us cs
 - Everything is small while FPS is still capped: the stall is outside
   mfmediaengine.
 
+### GPU time of transfers and destination texture
+
+`WINE_MFME_PROFILE=1` also reports how long the GPU takes to execute the
+commands of each transfer, measured with D3D11 timestamp queries, in the same
+line as `gpu(transfer): n=… avg=…us max=…us skipped=…`. `skipped` counts
+transfers that were not measured because the previous results were not ready.
+This is the GPU cost of Wine's own copy (or draw) into the app's texture, so it
+shows whether any of the extra GPU time per frame comes from the frame hand-off.
+
+A second kind of line is printed once, and again whenever the textures change:
+
+```
+mfme-prof 0x…: fast copy transfer | src 1920x1080 fmt=87 usage=0 bind=0x28 … | dst 0x… 1920x1080 fmt=87 usage=0 bind=0x8 cpu=0 misc=0x0 mips=1 array=1 samples=1
+```
+
+It shows the format, usage, bind, CPU access and misc flags, mip levels and
+size of the texture the app gave us (`dst`). Unusual flags such as a shared or
+dynamic texture, many mip levels, or a very large size can make a texture more
+expensive to draw with later.
+
 ## Source Reader players (`WINE_MFRW_PROFILE`)
 
 Players that decode through `IMFSourceReader` (for example Unity's built-in
