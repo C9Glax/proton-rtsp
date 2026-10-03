@@ -53,3 +53,41 @@ mfme-prof 0x... : window 1000123us | tick: n=75 with_frame=30 gap_max=14000us cs
   pipeline is not keeping up, which is independent of the render thread.
 - Everything is small while FPS is still capped: the stall is outside
   mfmediaengine.
+
+## Source Reader players (`WINE_MFRW_PROFILE`)
+
+Players that decode through `IMFSourceReader` (for example Unity's built-in
+video player, which loads `mfreadwrite.dll` on the main game thread) never use
+the media engine, so `WINE_MFME_PROFILE` stays silent for them. To profile
+these, set `WINE_MFRW_PROFILE=1` as well. Both variables can be set together:
+
+```
+WINE_MFME_PROFILE=1 WINE_MFRW_PROFILE=1 PROTON_LOG=1 %command%
+```
+
+To see which path a player uses, check which DLLs loaded:
+
+```
+grep -ioE 'loaded [^ ]*(mfmediaengine|mfreadwrite|quartz)\.dll' ~/steam-438100.log | sort | uniq -c
+```
+
+One line per second is printed (`grep mfrw-prof ~/steam-438100.log`):
+
+```
+mfrw-prof: window 1000100us | ReadSample: n=75 async=0 sync=75 sync_avg=31000us sync_max=40000us
+ cs_wait_max=0us gap_max=33000us thread_changes=0 last_tid=01c0 | OnReadSample: n=0 gap_max=0us
+```
+
+| Field | Meaning |
+| --- | --- |
+| `n / async / sync` | `ReadSample` calls, split by whether the app uses a callback |
+| `sync_avg / sync_max` | How long synchronous calls block the calling thread |
+| `cs_wait_max` | Longest wait for the reader's lock |
+| `gap_max` | Longest time between two calls |
+| `thread_changes / last_tid` | Whether more than one thread calls, and the last caller's thread id |
+| `OnReadSample` | Samples delivered through the async callback and the longest gap |
+
+If `sync_avg` is close to the video's frame interval (about 33ms for 30fps) and
+`last_tid` is the game's main thread (the thread id that also loaded `d3d11.dll`
+in the log), the game thread is waiting for the next video frame, which would
+lock its frame rate to the video's.
