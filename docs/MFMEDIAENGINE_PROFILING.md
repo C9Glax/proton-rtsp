@@ -92,50 +92,31 @@ If `sync_avg` is close to the video's frame interval (about 33ms for 30fps) and
 in the log), the game thread is waiting for the next video frame, which would
 lock its frame rate to the video's.
 
-## D3D11 video buffer locking (`WINE_MFPLAT_PROFILE` and related switches)
+## Findings so far
 
-Profiling a busy VRChat world with a 1080p30 RTSP stream showed the media
-engine itself doing almost no work on the game thread (frame transfers took a
-few microseconds, the frame queue stayed full, nothing waited on a lock), while
-the game ran at 24-28fps with the GPU only about two thirds busy. Hardware
-decoding was not the cause (the same with and without
-`--enable-hw-video-decoding`).
+Profiling a busy VRChat world (VR, 75Hz) with a 1080p30 RTSP stream in an AVPro
+player, where the game dropped to 24-28fps:
 
-The video work that does cost time is writing decoded frames into D3D11-backed
-buffers, which an app gets when it supplies a DXGI device manager (AVPro Video
-does). Locking one for CPU access maps a staging texture, and each unlock queues
-a GPU copy from it. Mapping the same staging texture again before the GPU has
-executed that copy waits for it, behind everything the game has queued.
+- The Wine media engine is not the bottleneck. Frame transfers took a few
+  microseconds, frames were never re-uploaded, nothing waited on the engine or
+  device locks, and the frame queue stayed full with the video arriving at 30
+  frames per second.
+- CPU capacity is not the limit (about 75% of the CPU idle, no thread near
+  saturation), and hardware decoding is not the cause: the frame rate was the
+  same with and without `--enable-hw-video-decoding`, and the video decode engine
+  read 0% in the software decoding case.
+- The GPU was not saturated either (graphics engine about 70% busy). The game's
+  frame time is quantised by the 75Hz compositor: 37.5fps needs every frame
+  within about 26.7ms, otherwise it drops to 25fps. A world that is already near
+  that limit can be pushed over it by a small extra cost, which would make the
+  drop look sudden when a video starts and recover when it stops.
+- Two attempted fixes did not change the frame rate and were reverted: locking
+  D3D11 video buffers write-only/read-only instead of read-write (this removes a
+  GPU readback per frame), and rotating staging textures with
+  `D3D11_MAP_FLAG_DO_NOT_WAIT`. Mapping the buffers still took 6-12ms with the
+  second change even though no texture was ever busy, so that wait is the game
+  being busy, not the cause of the low frame rate.
 
-Two changes were made, and each has a switch to go back to the old behaviour so
-the same build can be compared:
-
-1. Output buffers are locked write-only and input buffers read-only, which
-   removes a GPU-to-CPU readback per frame. This alone did not change the frame
-   rate in testing. `WINE_MF_LEGACY_2D_LOCK=1` restores the old read-write locks.
-2. Write-only locks rotate between up to three staging textures and map with
-   `D3D11_MAP_FLAG_DO_NOT_WAIT`, creating another one instead of waiting when all
-   are busy. `WINE_MF_DXGI_BLOCKING_MAP=1` goes back to mapping a single staging
-   texture and waiting for it.
-
-| Variable | Effect |
-| --- | --- |
-| `WINE_MF_LEGACY_2D_LOCK=1` | Always lock read-write (the original behaviour; implies the blocking map) |
-| `WINE_MF_DXGI_BLOCKING_MAP=1` | Keep write-only locks, but map one staging texture and wait for the GPU |
-| `WINE_MFPLAT_PROFILE=1` | One `mfplat-prof` line per second |
-
-```
-mfplat-prof: window 1000100us | dxgi map: n=30 readback=0 avg=40us max=300us | write staging: busy=2 created=1 blocked=0 | unmap: n=30 avg=5us max=20us
-```
-
-| Field | Meaning |
-| --- | --- |
-| `map n / avg / max` | Locks of D3D11 buffers and how long mapping took. Long maps mean the thread waited for the GPU |
-| `readback` | Maps that first copied the texture to the CPU (should be 0 for decoder output) |
-| `busy` | Write locks that found every existing staging texture still in use |
-| `created` | Extra staging textures created because of that (at most two per buffer) |
-| `blocked` | Write locks that had to wait for the GPU anyway (should stay near 0) |
-
-To compare, play the same stream in the same world and note your frame rate
-with the default, with `WINE_MF_DXGI_BLOCKING_MAP=1` and with
-`WINE_MF_LEGACY_2D_LOCK=1`.
+Open question: how much GPU/CPU time per frame playing video adds in the same
+world. It needs a baseline without video (frame rate and GPU load) to compare
+against, and tests with a lower video resolution and frame rate.
