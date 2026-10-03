@@ -22,5 +22,14 @@ echo "Using $proton"
 for mode in fixed blocking; do
   echo; echo "=== $mode ==="
   if [ "$mode" = blocking ]; then export DXVK_KEYED_MUTEX_BLOCKING=1; else unset DXVK_KEYED_MUTEX_BLOCKING; fi
-  "$proton/proton" run "$here/kmtest.exe" "${2:-300}" "${3:-20}" "${4:-1920}" 2>&1 | grep -v '^\(fsync\|esync\|wineserver\)' || true
+  rm -f "$here/kmtest-$mode.log"
+  mkdir -p "$here/logs"
+  rc=0
+  PROTON_LOG=1 PROTON_LOG_DIR="$here/logs" "$proton/proton" run "$here/kmtest.exe" "${2:-300}" "${3:-20}" "${4:-1920}" >/dev/null 2>&1 || rc=$?
+  if [ -s "$here/kmtest-$mode.log" ]; then
+    cat "$here/kmtest-$mode.log"
+  else
+    echo "No output was written (exit code $rc): kmtest.exe did not start or crashed."
+    echo "Check $here/logs/steam-*.log (search for 'err:' and 'kmtest')."
+  fi
 done

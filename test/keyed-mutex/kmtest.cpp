@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 
@@ -49,6 +50,19 @@ static int make_device(IDXGIAdapter* adapter, ID3D11Device** dev, ID3D11DeviceCo
 }
 
 int main(int argc, char** argv) {
+  // A console window under Proton can close before its output is readable, so
+  // everything is written to kmtest-<mode>.log next to the exe (run.sh prints it).
+  {
+    char path[MAX_PATH];
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (slash) slash[1] = 0;
+    const char* m = getenv("DXVK_KEYED_MUTEX_BLOCKING");
+    strcat(path, (m && m[0] == '1') ? "kmtest-blocking.log" : "kmtest-fixed.log");
+    if (!freopen(path, "w", stdout)) return 3;
+    setvbuf(stdout, nullptr, _IONBF, 0);
+  }
+  printf("kmtest started\n");
   int frames = argc > 1 ? atoi(argv[1]) : 300;
   int load   = argc > 2 ? atoi(argv[2]) : 20;
   int size   = argc > 3 ? atoi(argv[3]) : 1920;
