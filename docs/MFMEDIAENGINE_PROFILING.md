@@ -92,34 +92,50 @@ If `sync_avg` is close to the video's frame interval (about 33ms for 30fps) and
 in the log), the game thread is waiting for the next video frame, which would
 lock its frame rate to the video's.
 
-## D3D11 video buffer locking (`WINE_MFPLAT_PROFILE`, `WINE_MF_LEGACY_2D_LOCK`)
+## D3D11 video buffer locking (`WINE_MFPLAT_PROFILE` and related switches)
 
 Profiling a busy VRChat world with a 1080p30 RTSP stream showed the media
 engine itself doing almost no work on the game thread (frame transfers took a
 few microseconds, the frame queue stayed full, nothing waited on a lock), while
-the game ran at 24-28fps and the video-related `wine_threadpool` worker used
-about a third of a core. The cost is in how decoded frames are written into
-D3D11-backed buffers.
+the game ran at 24-28fps with the GPU only about two thirds busy. Hardware
+decoding was not the cause (the same with and without
+`--enable-hw-video-decoding`).
 
-When an app supplies a DXGI device manager (AVPro Video does), decoder output
-buffers are D3D11 textures. Locking one for CPU access used to copy the texture
-to a staging texture and map it for reading, which waits for the GPU to finish
-the copy behind whatever the game has queued, once per video frame, and
-unlocking copied everything back and flushed the context. Now output buffers are
-locked write-only and input buffers read-only, which removes the readback.
+The video work that does cost time is writing decoded frames into D3D11-backed
+buffers, which an app gets when it supplies a DXGI device manager (AVPro Video
+does). Locking one for CPU access maps a staging texture, and each unlock queues
+a GPU copy from it. Mapping the same staging texture again before the GPU has
+executed that copy waits for it, behind everything the game has queued.
+
+Two changes were made, and each has a switch to go back to the old behaviour so
+the same build can be compared:
+
+1. Output buffers are locked write-only and input buffers read-only, which
+   removes a GPU-to-CPU readback per frame. This alone did not change the frame
+   rate in testing. `WINE_MF_LEGACY_2D_LOCK=1` restores the old read-write locks.
+2. Write-only locks rotate between up to three staging textures and map with
+   `D3D11_MAP_FLAG_DO_NOT_WAIT`, creating another one instead of waiting when all
+   are busy. `WINE_MF_DXGI_BLOCKING_MAP=1` goes back to mapping a single staging
+   texture and waiting for it.
 
 | Variable | Effect |
 | --- | --- |
-| `WINE_MF_LEGACY_2D_LOCK=1` | Always lock read-write like before, to compare behaviour with the same build |
-| `WINE_MFPLAT_PROFILE=1` | One `mfplat-prof` line per second: |
+| `WINE_MF_LEGACY_2D_LOCK=1` | Always lock read-write (the original behaviour; implies the blocking map) |
+| `WINE_MF_DXGI_BLOCKING_MAP=1` | Keep write-only locks, but map one staging texture and wait for the GPU |
+| `WINE_MFPLAT_PROFILE=1` | One `mfplat-prof` line per second |
 
 ```
-mfplat-prof: window 1000100us | dxgi map: n=30 readback=0 avg=40us max=300us | unmap: n=30 avg=120us max=900us
+mfplat-prof: window 1000100us | dxgi map: n=30 readback=0 avg=40us max=300us | write staging: busy=2 created=1 blocked=0 | unmap: n=30 avg=5us max=20us
 ```
 
-`readback` counts maps that copied the texture to the CPU. With the old locking
-it equals `n`; with the new locking it should be 0 for decoder output. A large
-`map max`/`avg` together with a high `readback` count means the thread was waiting for the GPU.
+| Field | Meaning |
+| --- | --- |
+| `map n / avg / max` | Locks of D3D11 buffers and how long mapping took. Long maps mean the thread waited for the GPU |
+| `readback` | Maps that first copied the texture to the CPU (should be 0 for decoder output) |
+| `busy` | Write locks that found every existing staging texture still in use |
+| `created` | Extra staging textures created because of that (at most two per buffer) |
+| `blocked` | Write locks that had to wait for the GPU anyway (should stay near 0) |
 
 To compare, play the same stream in the same world and note your frame rate
-with and without `WINE_MF_LEGACY_2D_LOCK=1`.
+with the default, with `WINE_MF_DXGI_BLOCKING_MAP=1` and with
+`WINE_MF_LEGACY_2D_LOCK=1`.
