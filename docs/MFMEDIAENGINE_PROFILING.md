@@ -1,0 +1,193 @@
+# Profiling video playback FPS (mfmediaengine)
+
+Diagnostics for the case where a game's frame rate drops to the video's frame
+rate (or a multiple of it) while a video or stream is playing, e.g. VRChat with
+Unity VideoPlayer / AVPro Video.
+
+## Building with the diagnostics
+
+The profiling code is not part of the normal build. It lives in
+`patches/diagnostics/mf-diagnostics.patch` and is applied to the Wine source
+only when you ask for it, either at configure time:
+
+```
+./configure.sh --container-engine=podman --enable-mf-diagnostics
+make redist
+```
+
+or per invocation, `make redist MF_DIAGNOSTICS=1`. Without the flag (the default)
+`WINE_MFME_PROFILE` and `WINE_MFRW_PROFILE` do nothing because the code does not
+exist. Switching the flag restores the unpatched source and rebuilds the affected
+DLLs (`mfmediaengine`, `mfreadwrite`).
+
+The keyed mutex fix in DXVK (below) is part of every build; it is not a
+diagnostic.
+
+## Usage
+
+Set `WINE_MFME_PROFILE=1` in the game's launch options, start playback, and
+read the lines from the Wine log. In Steam:
+
+```
+WINE_MFME_PROFILE=1 PROTON_LOG=1 %command%
+```
+
+The log is written to `~/steam-<appid>.log` (VRChat: `~/steam-438100.log`);
+filter it with `grep mfme-prof`. The lines are printed regardless of the
+`WINEDEBUG` channel settings. Nothing is logged and nothing changes when the
+variable is unset.
+
+Each media engine prints one line per second:
+
+```
+mfme-prof 0x... : window 1000123us | tick: n=75 with_frame=30 gap_max=14000us cs_wait_max=0us
+ | transfer: n=75 new=30 repeat=45 fast=0 avg=9100us max=15000us gap_max=14000us cs_wait_max=0us dev_wait_max=20us
+ | upload: n=75 avg=8800us max=14800us | sink: frames_in=30 queued=5
+```
+
+| Field | Meaning |
+| --- | --- |
+| `tick n / with_frame` | `OnVideoStreamTick` calls, and how many reported a new frame |
+| `tick gap_max` | Longest time between two `OnVideoStreamTick` calls |
+| `transfer n` | `TransferVideoFrame` calls |
+| `new / repeat` | Calls that transferred a new frame vs. the same frame as the previous call |
+| `fast` | Calls served by the GPU-to-GPU copy (D3D11-backed samples) |
+| `transfer avg / max` | Time spent inside `TransferVideoFrame` (this runs on the game's thread) |
+| `cs_wait_max` | Longest wait for the media engine lock |
+| `dev_wait_max` | Longest wait for the D3D device lock |
+| `upload n / avg / max` | The software upload path (`UpdateSubresource`) |
+| `frames_in` | Frames the video pipeline delivered to the sink in the window |
+| `queued` | Frames waiting in the sink queue (see `WINE_MFME_VIDEO_QUEUE_SIZE`) |
+
+## Reading the result
+
+- `transfer avg` is a large part of the frame budget (about 13ms at 75Hz) and
+  `repeat` is large: frames are being re-uploaded every game frame. The upload
+  should be skipped when the frame hasn't changed.
+- `transfer avg` is large but `repeat` is near zero: the cost is the upload
+  itself (frame size / color conversion), not repetition.
+- `cs_wait_max` or `dev_wait_max` are large: the game's threads are blocking on
+  each other or on the device lock.
+- `frames_in` is below the video's frame rate or `queued` stays at 0: the
+  pipeline is not keeping up, which is independent of the render thread.
+- Everything is small while FPS is still capped: the stall is outside
+  mfmediaengine.
+
+### GPU time of transfers and destination texture
+
+`WINE_MFME_PROFILE=1` also reports how long the GPU takes to execute the
+commands of each transfer, measured with D3D11 timestamp queries, in the same
+line as `gpu(transfer): n=… avg=…us max=…us skipped=…`. `skipped` counts
+transfers that were not measured because the previous results were not ready.
+This is the GPU cost of Wine's own copy (or draw) into the app's texture, so it
+shows whether any of the extra GPU time per frame comes from the frame hand-off.
+
+A second kind of line is printed once, and again whenever the textures change:
+
+```
+mfme-prof 0x…: fast copy transfer | src 1920x1080 fmt=87 usage=0 bind=0x28 … | dst 0x… 1920x1080 fmt=87 usage=0 bind=0x8 cpu=0 misc=0x0 mips=1 array=1 samples=1
+```
+
+It shows the format, usage, bind, CPU access and misc flags, mip levels and
+size of the texture the app gave us (`dst`). Unusual flags such as a shared or
+dynamic texture, many mip levels, or a very large size can make a texture more
+expensive to draw with later.
+
+## Keyed mutex synchronization in DXVK (`DXVK_KEYED_MUTEX_BLOCKING`)
+
+The `dst` line printed by `WINE_MFME_PROFILE=1` shows that AVPro Video creates the
+texture it receives frames in with `MiscFlags=0x900`, which is
+`D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`: it is
+shared with another D3D11 device (Unity's) and guarded by a keyed mutex.
+
+In DXVK (as of `2cae043`), `IDXGIKeyedMutex::ReleaseSync` blocked the calling thread
+until the GPU had finished all work using the texture, and `AcquireSync` waited on the
+CPU for the previous owner's fence value. A tiny copy on the second device is executed
+behind everything the game has queued, so with a busy GPU each call stalled the calling
+thread, and with it the render thread, for about a frame, once per video frame. The CPU
+and the GPU could then no longer overlap, which makes a scene that was just fast enough for
+37.5fps at 75Hz fall to 25fps. It also explains why the stall only shows while the screen
+is in view or the GPU is busy, why the Wine media engine itself looks cheap, and why a
+Unity player (no keyed mutex) is unaffected.
+
+The `dxvk` submodule points to a DXVK tree (`C9Glax/dxvk`, branch `keyed-mutex-gpu-sync`) where
+acquire and release synchronize with fences on the GPU like native Windows does: the
+release queues a signal of the shared fence after the work submitted so far, and the
+acquire only takes the mutex and queues a GPU wait for the fence value.
+
+| Variable | Effect |
+| --- | --- |
+| `DXVK_KEYED_MUTEX_BLOCKING=1` | Use the old behaviour (wait for the GPU on the CPU), to compare with the same build |
+
+To compare, play the same stream in the same world and note your frame rate with
+the default, and with `DXVK_KEYED_MUTEX_BLOCKING=1`.
+
+If you built before this change, run `git submodule sync dxvk && git submodule update --init dxvk`
+since the submodule URL changed.
+
+## Source Reader players (`WINE_MFRW_PROFILE`)
+
+Players that decode through `IMFSourceReader` (for example Unity's built-in
+video player, which loads `mfreadwrite.dll` on the main game thread) never use
+the media engine, so `WINE_MFME_PROFILE` stays silent for them. To profile
+these, set `WINE_MFRW_PROFILE=1` as well. Both variables can be set together:
+
+```
+WINE_MFME_PROFILE=1 WINE_MFRW_PROFILE=1 PROTON_LOG=1 %command%
+```
+
+To see which path a player uses, check which DLLs loaded:
+
+```
+grep -ioE 'loaded [^ ]*(mfmediaengine|mfreadwrite|quartz)\.dll' ~/steam-438100.log | sort | uniq -c
+```
+
+One line per second is printed (`grep mfrw-prof ~/steam-438100.log`):
+
+```
+mfrw-prof: window 1000100us | ReadSample: n=75 async=0 sync=75 sync_avg=31000us sync_max=40000us
+ cs_wait_max=0us gap_max=33000us thread_changes=0 last_tid=01c0 | OnReadSample: n=0 gap_max=0us
+```
+
+| Field | Meaning |
+| --- | --- |
+| `n / async / sync` | `ReadSample` calls, split by whether the app uses a callback |
+| `sync_avg / sync_max` | How long synchronous calls block the calling thread |
+| `cs_wait_max` | Longest wait for the reader's lock |
+| `gap_max` | Longest time between two calls |
+| `thread_changes / last_tid` | Whether more than one thread calls, and the last caller's thread id |
+| `OnReadSample` | Samples delivered through the async callback and the longest gap |
+
+If `sync_avg` is close to the video's frame interval (about 33ms for 30fps) and
+`last_tid` is the game's main thread (the thread id that also loaded `d3d11.dll`
+in the log), the game thread is waiting for the next video frame, which would
+lock its frame rate to the video's.
+
+## Findings so far
+
+Profiling a busy VRChat world (VR, 75Hz) with a 1080p30 RTSP stream in an AVPro
+player, where the game dropped to 24-28fps:
+
+- The Wine media engine is not the bottleneck. Frame transfers took a few
+  microseconds, frames were never re-uploaded, nothing waited on the engine or
+  device locks, and the frame queue stayed full with the video arriving at 30
+  frames per second.
+- CPU capacity is not the limit (about 75% of the CPU idle, no thread near
+  saturation), and hardware decoding is not the cause: the frame rate was the
+  same with and without `--enable-hw-video-decoding`, and the video decode engine
+  read 0% in the software decoding case.
+- The GPU was not saturated either (graphics engine about 70% busy). The game's
+  frame time is quantised by the 75Hz compositor: 37.5fps needs every frame
+  within about 26.7ms, otherwise it drops to 25fps. A world that is already near
+  that limit can be pushed over it by a small extra cost, which would make the
+  drop look sudden when a video starts and recover when it stops.
+- Two attempted fixes did not change the frame rate and were reverted: locking
+  D3D11 video buffers write-only/read-only instead of read-write (this removes a
+  GPU readback per frame), and rotating staging textures with
+  `D3D11_MAP_FLAG_DO_NOT_WAIT`. Mapping the buffers still took 6-12ms with the
+  second change even though no texture was ever busy, so that wait is the game
+  being busy, not the cause of the low frame rate.
+
+Open question: how much GPU/CPU time per frame playing video adds in the same
+world. It needs a baseline without video (frame rate and GPU load) to compare
+against, and tests with a lower video resolution and frame rate.

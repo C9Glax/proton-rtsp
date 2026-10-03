@@ -653,9 +653,27 @@ $(eval $(call rules-autoconf,wine,aarch64,unix))
 
 $(WINE_SRC)/configure: $(WINE_ORIGIN)/aclocal.m4
 
+# Optional media diagnostics (WINE_MFME_PROFILE, WINE_MFRW_PROFILE), off by default. They are not part of the wine
+# sources but a patch that is applied to the synced sources when building with MF_DIAGNOSTICS=1, either as a make
+# argument or through configure.sh --enable-mf-diagnostics. See docs/MFMEDIAENGINE_PROFILING.md.
+MF_DIAGNOSTICS ?= 0
+MF_DIAGNOSTICS_PATCH := $(SRCDIR)/patches/diagnostics/mf-diagnostics.patch
+
+.PHONY: FORCE
+FORCE:
+
+# Records the value of MF_DIAGNOSTICS and only changes when it does, so that switching it re-syncs and rebuilds wine.
+$(OBJ)/.wine-mf-diagnostics-state: FORCE
+	@echo '$(MF_DIAGNOSTICS)' | cmp -s - $@ 2>/dev/null || echo '$(MF_DIAGNOSTICS)' > $@
+
+$(OBJ)/.wine-source: $(OBJ)/.wine-mf-diagnostics-state
+
 $(OBJ)/.wine-post-source:
 	cd $(WINE_SRC) && XDG_CACHE_HOME=$(OBJ) dlls/winevulkan/make_vulkan -x vk.xml -X video.xml
 	-cd $(WINE_SRC) && tools/make_specfiles
+ifeq ($(MF_DIAGNOSTICS),1)
+	cd $(WINE_SRC) && { patch -p1 -R --dry-run -s < $(MF_DIAGNOSTICS_PATCH) > /dev/null 2>&1 || patch -p1 < $(MF_DIAGNOSTICS_PATCH); }
+endif
 	touch $@
 
 $(OBJ)/.wine-x86_64-post-build:

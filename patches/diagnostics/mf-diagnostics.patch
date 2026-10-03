@@ -1,0 +1,775 @@
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 77b134e..a736a67 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -138,6 +138,36 @@ struct effects
+     size_t capacity;
+ };
+ 
++/* Optional render-thread diagnostics, enabled with WINE_MFME_PROFILE=1. All times are in microseconds and all
++ * fields are protected by media_engine::cs. */
++struct media_engine_profile
++{
++    LONGLONG window_start;
++    LONGLONG last_tick;
++    LONGLONG last_transfer;
++    LONGLONG last_pts;
++    unsigned int ticks, ticks_with_frame;
++    unsigned int transfers, transfers_new, transfers_repeat, transfers_fast;
++    LONGLONG tick_gap_max, tick_cs_wait_max;
++    LONGLONG transfer_gap_max, transfer_cs_wait_max;
++    LONGLONG transfer_total, transfer_max;
++    LONGLONG device_wait_total, device_wait_max;
++    LONGLONG upload_total, upload_max;
++    unsigned int uploads;
++    /* GPU time of the commands issued by a transfer, measured with timestamp queries. */
++    unsigned int gpu_n, gpu_skipped;
++    LONGLONG gpu_total, gpu_max;
++    /* Per-call state, valid while TransferVideoFrame is running. */
++    BOOL cur_fast, cur_seen;
++    BOOL cur_new;
++};
++
++struct media_engine_gpu_timing
++{
++    ID3D11Query *disjoint, *start, *end;
++    BOOL pending;
++};
++
+ struct media_engine
+ {
+     IMFMediaEngineEx IMFMediaEngineEx_iface;
+@@ -206,11 +236,301 @@ struct media_engine
+             } cb;
+         } d3d11;
+     } video_frame;
++    struct media_engine_profile profile;
++    struct media_engine_gpu_timing gpu_timing[4];
++    unsigned int gpu_timing_next;
++    struct
++    {
++        ID3D11Texture2D *dst;
++        D3D11_TEXTURE2D_DESC src_desc, dst_desc;
++        BOOL valid;
++    } logged_textures;
+     CRITICAL_SECTION cs;
+ };
+ 
++static BOOL media_engine_profile_enabled(void)
++{
++    static LONG state; /* 0: unknown, 1: disabled, 2: enabled. */
++    LONG value = ReadAcquire(&state);
++
++    if (!value)
++    {
++        const char *env = getenv("WINE_MFME_PROFILE");
++        value = env && atoi(env) > 0 ? 2 : 1;
++        InterlockedExchange(&state, value);
++    }
++
++    return value == 2;
++}
++
++/* Returns the current time in microseconds. */
++static LONGLONG media_engine_profile_now(void)
++{
++    static LONGLONG frequency;
++    LARGE_INTEGER counter;
++
++    if (!frequency)
++    {
++        LARGE_INTEGER freq;
++        QueryPerformanceFrequency(&freq);
++        frequency = freq.QuadPart;
++    }
++
++    QueryPerformanceCounter(&counter);
++    return counter.QuadPart * 1000000 / frequency;
++}
++
++/* Enters the engine critical section, reporting how long it had to wait for it (0 if not profiling). */
++static LONGLONG media_engine_profile_enter(struct media_engine *engine)
++{
++    LONGLONG start;
++
++    if (!media_engine_profile_enabled())
++    {
++        EnterCriticalSection(&engine->cs);
++        return 0;
++    }
++
++    if (TryEnterCriticalSection(&engine->cs))
++        return 0;
++
++    start = media_engine_profile_now();
++    EnterCriticalSection(&engine->cs);
++    return media_engine_profile_now() - start;
++}
++
++static void media_engine_profile_flush(struct media_engine *engine, LONGLONG now)
++{
++    struct media_engine_profile *p = &engine->profile;
++    unsigned int frames_in = 0, queued = 0;
++    LONGLONG last_tick, last_transfer, last_pts;
++
++    if (!p->window_start)
++    {
++        p->window_start = now;
++        return;
++    }
++
++    if (now - p->window_start < 1000000)
++        return;
++
++    if (engine->presentation.frame_sink)
++        video_frame_sink_get_stats(engine->presentation.frame_sink, &frames_in, &queued);
++
++    wine_dbg_printf("mfme-prof %p: window %uus | tick: n=%u with_frame=%u gap_max=%uus cs_wait_max=%uus"
++            " | transfer: n=%u new=%u repeat=%u fast=%u avg=%uus max=%uus gap_max=%uus cs_wait_max=%uus"
++            " dev_wait_max=%uus | upload: n=%u avg=%uus max=%uus | gpu(transfer): n=%u avg=%uus max=%uus skipped=%u"
++            " | sink: frames_in=%u queued=%u\n",
++            engine, (unsigned int)(now - p->window_start), p->ticks, p->ticks_with_frame,
++            (unsigned int)p->tick_gap_max, (unsigned int)p->tick_cs_wait_max,
++            p->transfers, p->transfers_new, p->transfers_repeat, p->transfers_fast,
++            (unsigned int)(p->transfers ? p->transfer_total / p->transfers : 0), (unsigned int)p->transfer_max,
++            (unsigned int)p->transfer_gap_max, (unsigned int)p->transfer_cs_wait_max,
++            (unsigned int)p->device_wait_max,
++            p->uploads, (unsigned int)(p->uploads ? p->upload_total / p->uploads : 0),
++            (unsigned int)p->upload_max,
++            p->gpu_n, (unsigned int)(p->gpu_n ? p->gpu_total / p->gpu_n : 0), (unsigned int)p->gpu_max,
++            p->gpu_skipped, frames_in, queued);
++
++    last_tick = p->last_tick;
++    last_transfer = p->last_transfer;
++    last_pts = p->last_pts;
++    memset(p, 0, sizeof(*p));
++    p->window_start = now;
++    p->last_tick = last_tick;
++    p->last_transfer = last_transfer;
++    p->last_pts = last_pts;
++}
++
++/* Called whenever a frame is fetched from the sink for a transfer. Tells whether it is a new or a repeated frame. */
++static void media_engine_profile_note_sample(struct media_engine *engine, IMFSample *sample, BOOL fast)
++{
++    struct media_engine_profile *p = &engine->profile;
++    LONGLONG pts;
++
++    if (!media_engine_profile_enabled())
++        return;
++
++    p->cur_fast = fast;
++    p->cur_seen = TRUE;
++    if (SUCCEEDED(IMFSample_GetSampleTime(sample, &pts)))
++    {
++        p->cur_new = pts != p->last_pts;
++        p->last_pts = pts;
++    }
++    else
++        p->cur_new = TRUE;
++}
++
++static void media_engine_profile_transfer_done(struct media_engine *engine, LONGLONG start, LONGLONG end,
++        LONGLONG cs_wait)
++{
++    struct media_engine_profile *p = &engine->profile;
++    LONGLONG duration = end - start;
++
++    p->transfers++;
++    if (p->cur_seen)
++    {
++        if (p->cur_new)
++            p->transfers_new++;
++        else
++            p->transfers_repeat++;
++        if (p->cur_fast)
++            p->transfers_fast++;
++    }
++    p->transfer_total += duration;
++    p->transfer_max = max(p->transfer_max, duration);
++    p->transfer_cs_wait_max = max(p->transfer_cs_wait_max, cs_wait);
++    if (p->last_transfer)
++        p->transfer_gap_max = max(p->transfer_gap_max, start - p->last_transfer);
++    p->last_transfer = start;
++
++    media_engine_profile_flush(engine, end);
++}
++
++static void media_engine_profile_tick_done(struct media_engine *engine, LONGLONG now, LONGLONG cs_wait,
++        BOOL with_frame)
++{
++    struct media_engine_profile *p = &engine->profile;
++
++    p->ticks++;
++    if (with_frame)
++        p->ticks_with_frame++;
++    p->tick_cs_wait_max = max(p->tick_cs_wait_max, cs_wait);
++    if (p->last_tick)
++        p->tick_gap_max = max(p->tick_gap_max, now - p->last_tick);
++    p->last_tick = now;
++
++    media_engine_profile_flush(engine, now);
++}
++
++static void media_engine_release_gpu_timing(struct media_engine *engine)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(engine->gpu_timing); ++i)
++    {
++        struct media_engine_gpu_timing *timing = &engine->gpu_timing[i];
++
++        if (timing->disjoint)
++            ID3D11Query_Release(timing->disjoint);
++        if (timing->start)
++            ID3D11Query_Release(timing->start);
++        if (timing->end)
++            ID3D11Query_Release(timing->end);
++    }
++    memset(engine->gpu_timing, 0, sizeof(engine->gpu_timing));
++    engine->gpu_timing_next = 0;
++}
++
++/* Reads back a finished measurement. Returns FALSE if the GPU has not got there yet. */
++static BOOL media_engine_gpu_timing_collect(struct media_engine *engine, ID3D11DeviceContext *context,
++        struct media_engine_gpu_timing *timing)
++{
++    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
++    struct media_engine_profile *p = &engine->profile;
++    UINT64 start, end;
++    LONGLONG duration;
++
++    if (ID3D11DeviceContext_GetData(context, (ID3D11Asynchronous *)timing->disjoint, &disjoint, sizeof(disjoint),
++            D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
++        return FALSE;
++
++    timing->pending = FALSE;
++    if (disjoint.Disjoint || !disjoint.Frequency
++            || ID3D11DeviceContext_GetData(context, (ID3D11Asynchronous *)timing->start, &start, sizeof(start), 0) != S_OK
++            || ID3D11DeviceContext_GetData(context, (ID3D11Asynchronous *)timing->end, &end, sizeof(end), 0) != S_OK)
++        return TRUE;
++
++    duration = (end - start) * 1000000 / disjoint.Frequency;
++    p->gpu_n++;
++    p->gpu_total += duration;
++    p->gpu_max = max(p->gpu_max, duration);
++    return TRUE;
++}
++
++/* Starts measuring how long the GPU takes to execute the commands issued until media_engine_gpu_timing_end(), using
++ * timestamp queries. Results are collected on later transfers so that this never waits for the GPU. */
++static struct media_engine_gpu_timing *media_engine_gpu_timing_begin(struct media_engine *engine,
++        ID3D11Device *device, ID3D11DeviceContext *context)
++{
++    struct media_engine_gpu_timing *timing;
++    D3D11_QUERY_DESC desc = {0};
++
++    if (!media_engine_profile_enabled())
++        return NULL;
++
++    timing = &engine->gpu_timing[engine->gpu_timing_next];
++    engine->gpu_timing_next = (engine->gpu_timing_next + 1) % ARRAY_SIZE(engine->gpu_timing);
++
++    if (timing->pending && !media_engine_gpu_timing_collect(engine, context, timing))
++    {
++        engine->profile.gpu_skipped++;
++        return NULL;
++    }
++
++    if (!timing->disjoint)
++    {
++        desc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
++        if (FAILED(ID3D11Device_CreateQuery(device, &desc, &timing->disjoint)))
++            return NULL;
++        desc.Query = D3D11_QUERY_TIMESTAMP;
++        if (FAILED(ID3D11Device_CreateQuery(device, &desc, &timing->start))
++                || FAILED(ID3D11Device_CreateQuery(device, &desc, &timing->end)))
++        {
++            ID3D11Query_Release(timing->disjoint);
++            if (timing->start)
++                ID3D11Query_Release(timing->start);
++            memset(timing, 0, sizeof(*timing));
++            return NULL;
++        }
++    }
++
++    ID3D11DeviceContext_Begin(context, (ID3D11Asynchronous *)timing->disjoint);
++    ID3D11DeviceContext_End(context, (ID3D11Asynchronous *)timing->start);
++    return timing;
++}
++
++static void media_engine_gpu_timing_end(ID3D11DeviceContext *context, struct media_engine_gpu_timing *timing)
++{
++    if (!timing)
++        return;
++
++    ID3D11DeviceContext_End(context, (ID3D11Asynchronous *)timing->end);
++    ID3D11DeviceContext_End(context, (ID3D11Asynchronous *)timing->disjoint);
++    timing->pending = TRUE;
++}
++
++/* Logs the source and destination textures of a transfer, whenever they change. */
++static void media_engine_profile_log_textures(struct media_engine *engine, const char *path,
++        const D3D11_TEXTURE2D_DESC *src, ID3D11Texture2D *dst_texture, const D3D11_TEXTURE2D_DESC *dst)
++{
++    if (!media_engine_profile_enabled())
++        return;
++
++    if (engine->logged_textures.valid && engine->logged_textures.dst == dst_texture
++            && !memcmp(&engine->logged_textures.src_desc, src, sizeof(*src))
++            && !memcmp(&engine->logged_textures.dst_desc, dst, sizeof(*dst)))
++        return;
++
++    engine->logged_textures.valid = TRUE;
++    engine->logged_textures.dst = dst_texture;
++    engine->logged_textures.src_desc = *src;
++    engine->logged_textures.dst_desc = *dst;
++
++    wine_dbg_printf("mfme-prof %p: %s transfer | src %ux%u fmt=%u usage=%u bind=%#x cpu=%#x misc=%#x mips=%u"
++            " array=%u samples=%u | dst %p %ux%u fmt=%u usage=%u bind=%#x cpu=%#x misc=%#x mips=%u array=%u"
++            " samples=%u\n", engine, path,
++            src->Width, src->Height, src->Format, src->Usage, src->BindFlags, src->CPUAccessFlags, src->MiscFlags,
++            src->MipLevels, src->ArraySize, src->SampleDesc.Count,
++            dst_texture, dst->Width, dst->Height, dst->Format, dst->Usage, dst->BindFlags, dst->CPUAccessFlags,
++            dst->MiscFlags, dst->MipLevels, dst->ArraySize, dst->SampleDesc.Count);
++}
++
+ static void media_engine_release_video_frame_resources(struct media_engine *engine)
+ {
++    media_engine_release_gpu_timing(engine);
++
+     if (engine->video_frame.d3d11.vb)
+         ID3D11Buffer_Release(engine->video_frame.d3d11.vb);
+     if (engine->video_frame.d3d11.ps_cb)
+@@ -234,6 +554,7 @@ static void media_engine_release_video_frame_resources(struct media_engine *engi
+ 
+ static HRESULT media_engine_lock_d3d_device(struct media_engine *engine, ID3D11Device **device)
+ {
++    LONGLONG wait_start = 0;
+     HRESULT hr;
+ 
+     if (!engine->device_manager)
+@@ -251,8 +572,16 @@ static HRESULT media_engine_lock_d3d_device(struct media_engine *engine, ID3D11D
+         }
+     }
+ 
++    if (media_engine_profile_enabled())
++        wait_start = media_engine_profile_now();
+     hr = IMFDXGIDeviceManager_LockDevice(engine->device_manager, engine->device_handle, &IID_ID3D11Device,
+             (void **)device, TRUE);
++    if (wait_start)
++    {
++        LONGLONG wait = media_engine_profile_now() - wait_start;
++        engine->profile.device_wait_total += wait;
++        engine->profile.device_wait_max = max(engine->profile.device_wait_max, wait);
++    }
+     if (hr == MF_E_DXGI_NEW_VIDEO_DEVICE)
+     {
+         IMFDXGIDeviceManager_CloseDeviceHandle(engine->device_manager, engine->device_handle);
+@@ -2583,6 +2912,7 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     IMFMediaBuffer *media_buffer;
+     ID3D11Texture2D *src_texture;
+     ID3D11Device *device;
++    LONGLONG upload_start = 0;
+     IMFSample *sample;
+     UINT subresource;
+     HRESULT hr;
+@@ -2590,6 +2920,12 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     if (!engine->presentation.frame_sink || !video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+         return;
+ 
++    if (media_engine_profile_enabled())
++    {
++        media_engine_profile_note_sample(engine, sample, FALSE);
++        upload_start = media_engine_profile_now();
++    }
++
+     ID3D11Texture2D_GetDesc(engine->video_frame.d3d11.source, &surface_desc);
+ 
+     switch (surface_desc.Format)
+@@ -2637,6 +2973,14 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     }
+ 
+     IMFSample_Release(sample);
++
++    if (upload_start)
++    {
++        LONGLONG duration = media_engine_profile_now() - upload_start;
++        engine->profile.uploads++;
++        engine->profile.upload_total += duration;
++        engine->profile.upload_max = max(engine->profile.upload_max, duration);
++    }
+ }
+ 
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+@@ -2649,6 +2993,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     ID3D11Texture2D *src_texture;
+     RECT dst_rect_default = {0};
+     D3D11_BOX src_box = {0};
++    struct media_engine_gpu_timing *timing;
+     ID3D11Device *device;
+     IMFSample *sample;
+     UINT subresource;
+@@ -2664,12 +3009,15 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     if (!engine->presentation.frame_sink || !video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+         return MF_E_UNEXPECTED;
+     hr = get_d3d11_resource_from_sample(sample, &src_texture, &subresource);
++    if (SUCCEEDED(hr))
++        media_engine_profile_note_sample(engine, sample, TRUE);
+     IMFSample_Release(sample);
+     if (FAILED(hr))
+         return hr;
+ 
+     ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+     ID3D11Texture2D_GetDesc(dst_texture, &dst_desc);
++    media_engine_profile_log_textures(engine, "fast copy", &src_desc, dst_texture, &dst_desc);
+ 
+     src_box.left = src_rect->left * src_desc.Width;
+     src_box.top = src_rect->top * src_desc.Height;
+@@ -2692,8 +3040,10 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     }
+ 
+     ID3D11Device_GetImmediateContext(device, &context);
++    timing = media_engine_gpu_timing_begin(engine, device, context);
+     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
+             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
++    media_engine_gpu_timing_end(context, timing);
+     ID3D11DeviceContext_Release(context);
+ 
+     media_engine_unlock_d3d_device(engine, device);
+@@ -2710,6 +3060,8 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+     ID3D11RenderTargetView *rtv;
+     unsigned int stride, offset;
+     D3D11_TEXTURE2D_DESC desc;
++    struct media_engine_gpu_timing *timing;
++    D3D11_TEXTURE2D_DESC src_desc;
+     BOOL device_mismatch;
+     struct vec3 quad[4];
+     D3D11_VIEWPORT vp;
+@@ -2747,6 +3099,9 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+     }
+ 
+     ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11Texture2D_GetDesc(engine->video_frame.d3d11.source, &src_desc);
++    media_engine_profile_log_textures(engine, "draw", &src_desc, texture, &desc);
++    timing = media_engine_gpu_timing_begin(engine, device, context);
+ 
+     /* Whole destination is cleared, regardless of specified rectangle. */
+     ID3D11DeviceContext_ClearRenderTargetView(context, rtv, black);
+@@ -2841,6 +3196,7 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+     ID3D11DeviceContext_OMSetRenderTargets(context, 1, &rtv, NULL);
+ 
+     ID3D11DeviceContext_Draw(context, 4, 0);
++    media_engine_gpu_timing_end(context, timing);
+ 
+     ID3D11RenderTargetView_Release(rtv);
+     ID3D11DeviceContext_Release(context);
+@@ -2973,11 +3329,18 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+     HRESULT hr = E_NOINTERFACE;
+     IWICBitmap *bitmap;
+ 
++    LONGLONG profile_start = 0, cs_wait;
++
+     TRACE("%p, %p, %s, %s, %p.\n", iface, surface, src_rect ? wine_dbg_sprintf("(%f,%f)-(%f,%f)",
+             src_rect->left, src_rect->top, src_rect->right, src_rect->bottom) : "(null)",
+             wine_dbgstr_rect(dst_rect), color);
+ 
+-    EnterCriticalSection(&engine->cs);
++    cs_wait = media_engine_profile_enter(engine);
++    if (media_engine_profile_enabled())
++    {
++        profile_start = media_engine_profile_now();
++        engine->profile.cur_seen = engine->profile.cur_fast = engine->profile.cur_new = FALSE;
++    }
+ 
+     if (SUCCEEDED(IUnknown_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture)))
+     {
+@@ -2998,6 +3361,12 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+         FIXME("Unsupported destination type.\n");
+     }
+ 
++    if (profile_start)
++    {
++        LONGLONG now = media_engine_profile_now();
++        media_engine_profile_transfer_done(engine, profile_start, now, cs_wait);
++    }
++
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+@@ -3006,11 +3375,12 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LONGLONG *pts)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    LONGLONG cs_wait;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, pts);
+ 
+-    EnterCriticalSection(&engine->cs);
++    cs_wait = media_engine_profile_enter(engine);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+@@ -3028,6 +3398,9 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LO
+             hr = S_FALSE;
+     }
+ 
++    if (media_engine_profile_enabled())
++        media_engine_profile_tick_done(engine, media_engine_profile_now(), cs_wait, hr == S_OK);
++
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+diff --git a/dlls/mfmediaengine/mediaengine_private.h b/dlls/mfmediaengine/mediaengine_private.h
+index 3b280a6..c02268e 100644
+--- a/dlls/mfmediaengine/mediaengine_private.h
++++ b/dlls/mfmediaengine/mediaengine_private.h
+@@ -26,4 +26,5 @@ HRESULT video_frame_sink_query_iface(struct video_frame_sink *object, REFIID rii
+ ULONG video_frame_sink_release(struct video_frame_sink *sink);
+ int video_frame_sink_get_sample(struct video_frame_sink *sink, IMFSample **sample);
+ HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG *pts);
++void video_frame_sink_get_stats(struct video_frame_sink *sink, unsigned int *frames_in, unsigned int *queued);
+ void video_frame_sink_notify_end_of_presentation_segment(struct video_frame_sink *sink);
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+index 1e1dd6f..0adfa7a 100644
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -107,6 +107,7 @@ struct video_frame_sink
+     enum sink_state state;
+     unsigned int flags;
+     struct sample_queue queue;
++    unsigned int frames_in; /* Samples received since the last video_frame_sink_get_stats() call. */
+     bool sample_request_pending;
+     IUnknown *scheduled_request_sample_cancel_key;
+     bool eos;
+@@ -457,6 +458,8 @@ static HRESULT WINAPI video_frame_sink_stream_ProcessSample(IMFStreamSink *iface
+ 
+         if (SUCCEEDED(hr))
+         {
++            sink->frames_in++;
++
+             if (!(sink->flags & FLAGS_FIRST_FRAME))
+             {
+                 video_frame_sink_notify(sink, MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY);
+@@ -1420,6 +1423,16 @@ int video_frame_sink_get_sample(struct video_frame_sink *sink, IMFSample **ret)
+     return !!*ret;
+ }
+ 
++/* Diagnostics only: reports how many samples arrived since the previous call and how many are currently queued. */
++void video_frame_sink_get_stats(struct video_frame_sink *sink, unsigned int *frames_in, unsigned int *queued)
++{
++    EnterCriticalSection(&sink->cs);
++    *frames_in = sink->frames_in;
++    *queued = sink->queue.used;
++    sink->frames_in = 0;
++    LeaveCriticalSection(&sink->cs);
++}
++
+ static HRESULT sample_get_pts(IMFSample *sample, MFTIME clocktime, LONGLONG *pts)
+ {
+     HRESULT hr = S_FALSE;
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+index ba58e0b..b92125c 100644
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -43,6 +43,135 @@ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_ABGR32, D3DFMT_A8B8G8R8);
+ 
++/* Optional diagnostics, enabled with WINE_MFRW_PROFILE=1: logs one line per second about IMFSourceReader::ReadSample
++ * calls (how long they block, which thread makes them) and about samples reported through the async callback.
++ * All times are in microseconds. Aggregated over all readers in the process. */
++static CRITICAL_SECTION profile_cs;
++static CRITICAL_SECTION_DEBUG profile_cs_debug =
++{
++    0, 0, &profile_cs,
++    { &profile_cs_debug.ProcessLocksList, &profile_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": profile_cs") }
++};
++static CRITICAL_SECTION profile_cs = { &profile_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct
++{
++    LONGLONG window_start, last_call, last_callback;
++    unsigned int calls, async_calls, sync_calls, callbacks, thread_changes;
++    LONGLONG sync_total, sync_max, cs_wait_max, gap_max, callback_gap_max;
++    DWORD last_tid;
++} profile;
++
++static BOOL profile_enabled(void)
++{
++    static LONG state; /* 0: unknown, 1: disabled, 2: enabled. */
++    LONG value = ReadAcquire(&state);
++
++    if (!value)
++    {
++        const char *env = getenv("WINE_MFRW_PROFILE");
++        value = env && atoi(env) > 0 ? 2 : 1;
++        InterlockedExchange(&state, value);
++    }
++
++    return value == 2;
++}
++
++static LONGLONG profile_now(void)
++{
++    static LONGLONG frequency;
++    LARGE_INTEGER counter;
++
++    if (!frequency)
++    {
++        LARGE_INTEGER freq;
++        QueryPerformanceFrequency(&freq);
++        frequency = freq.QuadPart;
++    }
++
++    QueryPerformanceCounter(&counter);
++    return counter.QuadPart * 1000000 / frequency;
++}
++
++/* Must be called with profile_cs held. */
++static void profile_flush(LONGLONG now)
++{
++    LONGLONG last_call, last_callback;
++    DWORD last_tid;
++
++    if (!profile.window_start)
++    {
++        profile.window_start = now;
++        return;
++    }
++
++    if (now - profile.window_start < 1000000)
++        return;
++
++    wine_dbg_printf("mfrw-prof: window %uus | ReadSample: n=%u async=%u sync=%u sync_avg=%uus sync_max=%uus"
++            " cs_wait_max=%uus gap_max=%uus thread_changes=%u last_tid=%04lx"
++            " | OnReadSample: n=%u gap_max=%uus\n",
++            (unsigned int)(now - profile.window_start), profile.calls, profile.async_calls, profile.sync_calls,
++            (unsigned int)(profile.sync_calls ? profile.sync_total / profile.sync_calls : 0),
++            (unsigned int)profile.sync_max, (unsigned int)profile.cs_wait_max, (unsigned int)profile.gap_max,
++            profile.thread_changes, profile.last_tid, profile.callbacks, (unsigned int)profile.callback_gap_max);
++
++    last_call = profile.last_call;
++    last_callback = profile.last_callback;
++    last_tid = profile.last_tid;
++    memset(&profile, 0, sizeof(profile));
++    profile.window_start = now;
++    profile.last_call = last_call;
++    profile.last_callback = last_callback;
++    profile.last_tid = last_tid;
++}
++
++static void profile_read_sample_done(LONGLONG start, LONGLONG end, LONGLONG cs_wait, BOOL async)
++{
++    DWORD tid = GetCurrentThreadId();
++
++    EnterCriticalSection(&profile_cs);
++
++    profile.calls++;
++    if (async)
++        profile.async_calls++;
++    else
++    {
++        LONGLONG duration = end - start;
++        profile.sync_calls++;
++        profile.sync_total += duration;
++        profile.sync_max = max(profile.sync_max, duration);
++    }
++    profile.cs_wait_max = max(profile.cs_wait_max, cs_wait);
++    if (profile.last_call)
++        profile.gap_max = max(profile.gap_max, start - profile.last_call);
++    profile.last_call = start;
++    if (profile.last_tid && profile.last_tid != tid)
++        profile.thread_changes++;
++    profile.last_tid = tid;
++
++    profile_flush(end);
++
++    LeaveCriticalSection(&profile_cs);
++}
++
++static void profile_callback_reported(void)
++{
++    LONGLONG now = profile_now();
++
++    EnterCriticalSection(&profile_cs);
++
++    profile.callbacks++;
++    if (profile.last_callback)
++        profile.callback_gap_max = max(profile.callback_gap_max, now - profile.last_callback);
++    profile.last_callback = now;
++
++    profile_flush(now);
++
++    LeaveCriticalSection(&profile_cs);
++}
++
+ struct stream_response
+ {
+     struct list entry;
+@@ -1502,8 +1631,12 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
+             LeaveCriticalSection(&reader->cs);
+ 
+             if (report_sample)
++            {
++                if (profile_enabled())
++                    profile_callback_reported();
+                 IMFSourceReaderCallback_OnReadSample(reader->async_callback, status, stream_index, stream_flags,
+                         timestamp, sample);
++            }
+ 
+             if (sample)
+                 IMFSample_Release(sample);
+@@ -1531,6 +1664,8 @@ static HRESULT WINAPI source_reader_async_commands_callback_Invoke(IMFAsyncCallb
+ 
+             if (response)
+             {
++                if (profile_enabled())
++                    profile_callback_reported();
+                 IMFSourceReaderCallback_OnReadSample(reader->async_callback, response->status, response->stream_index,
+                         response->stream_flags, response->timestamp, response->sample);
+                 source_reader_release_response(response);
+@@ -2378,24 +2513,39 @@ static HRESULT WINAPI src_reader_ReadSample(IMFSourceReaderEx *iface, DWORD inde
+         DWORD *stream_flags, LONGLONG *timestamp, IMFSample **sample)
+ {
+     struct source_reader *reader = impl_from_IMFSourceReaderEx(iface);
++    LONGLONG profile_start = 0, cs_wait = 0;
++    BOOL async;
+     HRESULT hr;
+ 
+     TRACE("%p, %#lx, %#lx, %p, %p, %p, %p\n", iface, index, flags, actual_index, stream_flags, timestamp, sample);
+ 
+-    EnterCriticalSection(&reader->cs);
++    if (profile_enabled())
++    {
++        profile_start = profile_now();
++        if (!TryEnterCriticalSection(&reader->cs))
++        {
++            EnterCriticalSection(&reader->cs);
++            cs_wait = profile_now() - profile_start;
++        }
++    }
++    else
++        EnterCriticalSection(&reader->cs);
+ 
+     while (reader->flags & SOURCE_READER_SEEKING)
+     {
+         SleepConditionVariableCS(&reader->state_event, &reader->cs, INFINITE);
+     }
+ 
+-    if (reader->async_callback)
++    if ((async = !!reader->async_callback))
+         hr = source_reader_read_sample_async(reader, index, flags, actual_index, stream_flags, timestamp, sample);
+     else
+         hr = source_reader_read_sample(reader, index, flags, actual_index, stream_flags, timestamp, sample);
+ 
+     LeaveCriticalSection(&reader->cs);
+ 
++    if (profile_start)
++        profile_read_sample_done(profile_start, profile_now(), cs_wait, async);
++
+     return hr;
+ }
+ 
