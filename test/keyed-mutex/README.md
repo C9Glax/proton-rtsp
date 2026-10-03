@@ -22,3 +22,10 @@ What to look for:
 - Both runs must end with `PASS` and not hang or print `AcquireSync failed`.
 
 `kmtest.exe` is built with `x86_64-w64-mingw32-g++ -O2 -static -o kmtest.exe kmtest.cpp -ld3d11 -ldxgi -luuid`.
+
+## When cross-device sharing does not work
+
+If the DXVK log says `Failed to open shared NT handle` and the sanity check fails, the second device
+cannot see the first device's data in your Wine build. The test then falls back to a single device that
+uses the keyed mutex on its own texture. That still measures the CPU stalls and checks the mutex
+hand-over and the data, but cannot say anything about visibility across devices.
