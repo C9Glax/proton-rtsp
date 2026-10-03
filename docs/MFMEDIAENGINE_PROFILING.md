@@ -91,3 +91,35 @@ If `sync_avg` is close to the video's frame interval (about 33ms for 30fps) and
 `last_tid` is the game's main thread (the thread id that also loaded `d3d11.dll`
 in the log), the game thread is waiting for the next video frame, which would
 lock its frame rate to the video's.
+
+## D3D11 video buffer locking (`WINE_MFPLAT_PROFILE`, `WINE_MF_LEGACY_2D_LOCK`)
+
+Profiling a busy VRChat world with a 1080p30 RTSP stream showed the media
+engine itself doing almost no work on the game thread (frame transfers took a
+few microseconds, the frame queue stayed full, nothing waited on a lock), while
+the game ran at 24-28fps and the video-related `wine_threadpool` worker used
+about a third of a core. The cost is in how decoded frames are written into
+D3D11-backed buffers.
+
+When an app supplies a DXGI device manager (AVPro Video does), decoder output
+buffers are D3D11 textures. Locking one for CPU access used to copy the texture
+to a staging texture and map it for reading, which waits for the GPU to finish
+the copy behind whatever the game has queued, once per video frame, and
+unlocking copied everything back and flushed the context. Now output buffers are
+locked write-only and input buffers read-only, which removes the readback.
+
+| Variable | Effect |
+| --- | --- |
+| `WINE_MF_LEGACY_2D_LOCK=1` | Always lock read-write like before, to compare behaviour with the same build |
+| `WINE_MFPLAT_PROFILE=1` | One `mfplat-prof` line per second: |
+
+```
+mfplat-prof: window 1000100us | dxgi map: n=30 readback=0 avg=40us max=300us | unmap: n=30 avg=120us max=900us
+```
+
+`readback` counts maps that copied the texture to the CPU. With the old locking
+it equals `n`; with the new locking it should be 0 for decoder output. A large
+`map max`/`avg` together with a high `readback` count means the thread was waiting for the GPU.
+
+To compare, play the same stream in the same world and note your frame rate
+with and without `WINE_MF_LEGACY_2D_LOCK=1`.
