@@ -1,6 +1,6 @@
 [submodule "wine"]
 	path = wine
-	url = ../wine
+	url = https://github.com/SpookySkeletons/wine
 [submodule "dxvk"]
 	path = dxvk
 	url = https://git.glax.dev/Glax/dxvk
